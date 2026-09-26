@@ -1,0 +1,16 @@
+build*/
+.vscode
+out
+dist
+node_modules
+.vscode-test
+*.vsix
+**/bin/
+**/obj/
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate*
+
+vcpkg_installed/

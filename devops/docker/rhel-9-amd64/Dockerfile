@@ -1,0 +1,35 @@
+# TODO: Add mcr.io retagged images
+FROM registry.access.redhat.com/ubi9/ubi@sha256:9295c5c688f487fa5cf27a734fa55ecd57aeb7dc0904ba537da4f42dfa1d0acb
+
+ARG CMAKE_VERSION=v3.30.1
+
+RUN yum install -y --disableplugin=subscription-manager \
+    autoconf \
+    gcc \
+    gcc-c++ \
+    git \
+    jq \
+    libtool \
+    make \
+    openssl-devel \
+    perl \
+    perl-IPC-Cmd \
+    python3 \
+    rpm-build \
+    tar \
+    unzip \
+    zip
+
+RUN python3 -m venv /opt/kompli-venv
+ENV PATH="/opt/kompli-venv/bin:${PATH}"
+
+WORKDIR /git
+
+# CMake
+RUN git clone https://github.com/Kitware/CMake --recursive -b ${CMAKE_VERSION}
+RUN cd CMake && ./bootstrap && make -j$(nproc) && make install && hash -r && rm -rf /git/CMake
+
+
+COPY .  /src
+WORKDIR /src
+RUN (cd external/vcpkg && ./bootstrap-vcpkg.sh) && (cd src && ../external/vcpkg/vcpkg install) && rm -rf /src

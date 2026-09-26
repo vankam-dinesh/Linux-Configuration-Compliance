@@ -1,0 +1,32 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/cpp
+{
+	"name": "kompli",
+	"build": {
+		"context": "..",
+		"dockerfile": "../devops/docker/ubuntu-24.04-amd64/Dockerfile"
+	},
+	// Features to add to the dev container. More info: https://containers.dev/features.
+	"features": {
+		"ghcr.io/devcontainers/features/common-utils:2": {
+			"installZsh": true,
+			"installOhMyZsh": true
+		},
+		"ghcr.io/devcontainers/features/github-cli:1": {}
+	},
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"eamodio.gitlens",
+				"github.copilot",
+				"github.vscode-github-actions",
+				"ms-vscode.cpptools-extension-pack"
+			]
+		}
+	},
+	"workspaceFolder": "/workspaces/kompli-osconfig",
+	"mounts": [
+		"source=${localWorkspaceFolder}/../azcorelinux-Compliance-AugmentationEngine,target=/workspaces/azcorelinux-Compliance-AugmentationEngine,type=bind,consistency=cached"
+	],
+	"remoteUser": "root"
+}

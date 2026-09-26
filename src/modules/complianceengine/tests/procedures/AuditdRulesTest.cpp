@@ -1,0 +1,772 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+#include "MockContext.h"
+
+#include <AuditdRules.h>
+#include <cstdio>
+#include <fstream>
+#include <gtest/gtest.h>
+#include <map>
+#include <string>
+#include <unistd.h>
+#include <vector>
+
+using ComplianceEngine::AuditAuditdRules;
+using ComplianceEngine::AuditdRulesParams;
+using ComplianceEngine::Error;
+using ComplianceEngine::IndicatorsTree;
+using ComplianceEngine::Result;
+using ComplianceEngine::Status;
+using ::testing::Return;
+
+class AuditdRulesCheckTest : public ::testing::Test
+{
+protected:
+    MockContext mContext;
+    IndicatorsTree indicators;
+
+    void SetUp() override
+    {
+        indicators.Push("AuditdRulesCheck");
+        // Default UID_MIN for tests
+        EXPECT_CALL(mContext, GetFileContents("/etc/login.defs")).WillRepeatedly(Return(Result<std::string>(std::string("UID_MIN 1000\n"))));
+    }
+
+    static std::string MakeTempDir()
+    {
+        char tmpl[] = "/tmp/auditrulesXXXXXX";
+        char* d = mkdtemp(tmpl);
+        return d ? std::string(d) : std::string();
+    }
+
+    static void WriteFile(const std::string& path, const std::string& content)
+    {
+        std::ofstream ofs(path);
+        ofs << content;
+        ofs.close();
+    }
+
+    static void RemoveFile(const std::string& path)
+    {
+        std::remove(path.c_str());
+    }
+
+    static void RemoveDir(const std::string& path)
+    {
+        rmdir(path.c_str());
+    }
+};
+
+// Test invalid requiredOptions regex
+TEST_F(AuditdRulesCheckTest, InvalidRequiredOptionsRegexReturnsError)
+{
+    AuditdRulesParams params;
+    params.searchItem = "-w /etc/sudoers";
+    params.requiredOptions.items = {"(invalid"}; // unbalanced paren
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+    ASSERT_FALSE(result.HasValue());
+}
+
+// Test invalid excludeOptions regex
+TEST_F(AuditdRulesCheckTest, InvalidExcludeOptionsRegexReturnsError)
+{
+    AuditdRulesParams params;
+    params.searchItem = "-w /etc/sudoers";
+    params.requiredOptions.items = {"-p wa"};
+    params.excludeOption = "[*"; // invalid regex
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+    ASSERT_FALSE(result.HasValue());
+}
+
+// Test auditctl -l command fails
+TEST_F(AuditdRulesCheckTest, AuditctlCommandFails)
+{
+    EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(Error("Command execution failed", -1))));
+
+    AuditdRulesParams params;
+    params.searchItem = "-w /etc/sudoers";
+    params.requiredOptions.items = {"-p wa"};
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+    ASSERT_TRUE(result.HasValue());
+    ASSERT_EQ(result.Value(), Status::NonCompliant);
+}
+
+// Test: override audit rules path with a temp directory containing matching rule -> Compliant
+TEST_F(AuditdRulesCheckTest, OverridePathWithMatchingFileRuleIsCompliant)
+{
+    // Running config has matching rule
+    EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(std::string("-w /etc/sudoers -p wa\n"))));
+
+    std::string dir = MakeTempDir();
+    ASSERT_FALSE(dir.empty());
+    std::string file = dir + "/test.rules";
+    WriteFile(file, "# sample\n-w /etc/sudoers -p wa\n");
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+
+    AuditdRulesParams params;
+    params.searchItem = "-w /etc/sudoers";
+    params.requiredOptions.items = {"-p wa"};
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+
+    // cleanup
+    RemoveFile(file);
+    RemoveDir(dir);
+
+    ASSERT_TRUE(result.HasValue());
+    ASSERT_EQ(result.Value(), Status::Compliant);
+}
+
+TEST_F(AuditdRulesCheckTest, TimeChangeSyscallsAcceptAnyNonemptyKey)
+{
+    const std::string directory = MakeTempDir();
+    ASSERT_FALSE(directory.empty());
+    const std::string filename = directory + "/sys.rules";
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", directory);
+    AuditdRulesParams params;
+    params.searchItem = "-S adjtimex,settimeofday,clock_settime";
+    params.requiredOptions.items = {"-F arch=b32",
+        "^-a[ \t]+(always,exit|exit,always)[ \t]+-F[ \t]+arch=b32[ \t]+-S[ \t]+[a-zA-Z0-9_,]+([ \t]+-S[ \t]+[a-zA-Z0-9_,]+)*[ \t]+(-F[ \t]+key=|-k[ "
+        "\t]+)[^ \t]+[ \t]*$"};
+    const std::vector<std::pair<std::string, Status>> cases = {
+        {"-a always,exit -F arch=b32 -S execve,settimeofday,adjtimex,init_module,clock_settime,clock_adjtime,finit_module,execveat -F key=auoms\n", Status::Compliant},
+        {"-a always,exit -F arch=b32 -S adjtimex,settimeofday,clock_settime -k site-audit\n", Status::Compliant},
+        {"-a always,exit -F arch=b32 -S adjtimex,settimeofday,clock_settime\n", Status::NonCompliant},
+        {"-a always,exit -F arch=b32 -S adjtimex,settimeofday,clock_settime -k \n", Status::NonCompliant},
+        {"-a always,exit -F arch=b32 -S adjtimex,settimeofday -k auoms\n", Status::NonCompliant},
+        {"-a always,exit -F arch=b32 -S adjtimex,settimeofday,clock_settime -C uid!=euid -F key=auoms\n", Status::NonCompliant},
+        {"-a always,exit -F arch=b32 -S adjtimex,settimeofday,clock_settime -F auid>=1000 -F auid!=-1 -F key=auoms\n", Status::NonCompliant},
+        {"-a exit,always\t-F arch=b32  -S adjtimex -S settimeofday,clock_settime\t-k site-audit\n", Status::Compliant},
+    };
+    for (const auto& entry : cases)
+    {
+        SCOPED_TRACE(entry.first);
+        WriteFile(filename, entry.first);
+        EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(entry.first)));
+        const auto result = AuditAuditdRules(params, indicators, mContext);
+        EXPECT_TRUE(result.HasValue());
+        if (result.HasValue())
+        {
+            EXPECT_EQ(entry.second, result.Value());
+        }
+    }
+    RemoveFile(filename);
+    RemoveDir(directory);
+}
+
+TEST_F(AuditdRulesCheckTest, SyscallFieldLayoutUsesRuntimeUidMin)
+{
+    const std::string directory = MakeTempDir();
+    ASSERT_FALSE(directory.empty());
+    const std::string filename = directory + "/sys.rules";
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", directory);
+    EXPECT_CALL(mContext, GetFileContents("/etc/login.defs")).WillRepeatedly(Return(Result<std::string>("UID_MIN 500\n")));
+    AuditdRulesParams params;
+    params.searchItem = "-S init_module";
+    params.requiredOptions.items = {"-F arch=b64",
+        "^-a[ \t]+(always,exit|exit,always)[ \t]+-F[ \t]+arch=b64[ \t]+-S[ \t]+[a-zA-Z0-9_,]+[ \t]+"
+        "(-F[ \t]+auid>=1000[ \t]+-F[ \t]+auid!=(unset|-1|4294967295)|-F[ \t]+auid!=(unset|-1|4294967295)[ \t]+-F[ \t]+auid>=1000)"
+        "[ \t]+(-F[ \t]+key=|-k[ \t]+)[^ \t]+[ \t]*$"};
+    const std::vector<std::pair<std::string, Status>> cases = {
+        {"-F auid>=500 -F auid!=-1 -F key=auoms", Status::Compliant},
+        {"-F auid!=unset -F auid>=500 -k alternate", Status::Compliant},
+        {"-F auid>=1000 -F auid!=-1 -F key=auoms", Status::NonCompliant},
+        {"-C uid!=euid -F auid>=500 -F auid!=-1 -F key=auoms", Status::NonCompliant},
+        {"-F key=auoms -F auid>=500 -F auid!=-1", Status::NonCompliant},
+    };
+    for (const auto& entry : cases)
+    {
+        SCOPED_TRACE(entry.first);
+        const std::string rule = "-a always,exit -F arch=b64 -S execve,init_module " + entry.first + "\n";
+        WriteFile(filename, rule);
+        EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(rule)));
+        const auto result = AuditAuditdRules(params, indicators, mContext);
+        ASSERT_TRUE(result.HasValue());
+        EXPECT_EQ(entry.second, result.Value());
+    }
+    RemoveFile(filename);
+    RemoveDir(directory);
+}
+
+// Test: override path where running has rule but files do not -> NonCompliant
+TEST_F(AuditdRulesCheckTest, OverridePathMissingFileRuleIsNonCompliant)
+{
+    EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(std::string("-w /etc/sudoers -p wa\n"))));
+
+    std::string dir = MakeTempDir();
+    ASSERT_FALSE(dir.empty());
+    std::string file = dir + "/test.rules";
+    WriteFile(file, "# unrelated rule\n-w /var/log/auth.log -p wa\n");
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+
+    AuditdRulesParams params;
+    params.searchItem = "-w /etc/sudoers";
+    params.requiredOptions.items = {"-p wa"};
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+
+    // cleanup
+    RemoveFile(file);
+    RemoveDir(dir);
+
+    ASSERT_TRUE(result.HasValue());
+    ASSERT_EQ(result.Value(), Status::NonCompliant);
+}
+
+// Test: invalid override path returns NonCompliant when directory cannot be opened
+TEST_F(AuditdRulesCheckTest, InvalidOverridePathReturnsNonCompliant)
+{
+    EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(std::string("No rules\n"))));
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", "/does/not/exist");
+
+    AuditdRulesParams params;
+    params.searchItem = "-w /etc/sudoers";
+    params.requiredOptions.items = {"-p wa"};
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+    ASSERT_TRUE(result.HasValue());
+    ASSERT_EQ(result.Value(), Status::NonCompliant);
+}
+
+// Test: syscall search compliant when both running and files match
+TEST_F(AuditdRulesCheckTest, SyscallSearchCompliantWithOverridePath)
+{
+    EXPECT_CALL(mContext, ExecuteCommand("auditctl -l"))
+        .WillOnce(Return(Result<std::string>(std::string("-S chattr,mount -F arch=b64 -a always,exit -F auid>=1000 -F auid!=4294967295\n"))));
+
+    std::string dir = MakeTempDir();
+    ASSERT_FALSE(dir.empty());
+    std::string file = dir + "/sys.rules";
+    WriteFile(file, "-S mount -F arch=b64 -a always,exit -F auid>=1000 -F auid!=4294967295\n");
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+
+    AuditdRulesParams params;
+    params.searchItem = "-S mount";
+    params.requiredOptions.items = {{"-F arch=b64", "-a (always,exit|exit,always)", "-F auid>=123", "-F auid!=(unset|-1|4294967295)"}};
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+
+    RemoveFile(file);
+    RemoveDir(dir);
+
+    ASSERT_TRUE(result.HasValue());
+    ASSERT_EQ(result.Value(), Status::Compliant);
+}
+
+TEST_F(AuditdRulesCheckTest, SyscallSuppressionRespectsFirstMatchingRule)
+{
+    const std::string auditing = "-a always,exit -F arch=b64 -S execve -C uid!=euid -F auid!=unset\n";
+    const std::string suppressing = "-a never,exit -F arch=b64 -S execve -F exe=/usr/bin/ls\n";
+    std::string dir = MakeTempDir();
+    ASSERT_FALSE(dir.empty());
+    std::string file = dir + "/execve.rules";
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+    AuditdRulesParams params;
+    params.searchItem = "-S execve";
+    params.requiredOptions.items = {"-F arch=b64", "-a (always,exit|exit,always)", "-C (euid!=uid|uid!=euid)", "-F auid!=(unset|-1|4294967295)"};
+    for (bool runningSuppressed : {false, true})
+    {
+        for (bool filesSuppressed : {false, true})
+        {
+            SCOPED_TRACE(::testing::Message() << "running suppressed=" << runningSuppressed << ", files suppressed=" << filesSuppressed);
+            EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(runningSuppressed ? suppressing + auditing : auditing + suppressing)));
+            WriteFile(file, filesSuppressed ? suppressing + auditing : auditing + suppressing);
+            IndicatorsTree caseIndicators;
+            caseIndicators.Push("AuditdRulesCheck");
+            auto result = AuditAuditdRules(params, caseIndicators, mContext);
+            ASSERT_TRUE(result.HasValue());
+            EXPECT_EQ(result.Value(), runningSuppressed || filesSuppressed ? Status::NonCompliant : Status::Compliant);
+        }
+    }
+    RemoveFile(file);
+    RemoveDir(dir);
+}
+
+TEST_F(AuditdRulesCheckTest, AdditionalAuditingRuleDoesNotInvalidateCompliantRule)
+{
+    const std::string rules =
+        "-a always,exit -F arch=b64 -S init_module -F auid>=1000 -F auid!=unset\n"
+        "-a always,exit -F arch=b64 -S execve,init_module -F auid!=unset\n";
+    EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(rules)));
+
+    std::string dir = MakeTempDir();
+    ASSERT_FALSE(dir.empty());
+    std::string file = dir + "/kernel.rules";
+    WriteFile(file, rules);
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+
+    AuditdRulesParams params;
+    params.searchItem = "init_module";
+    params.requiredOptions.items = {"-F arch=b64", "-a (always,exit|exit,always)", "-F auid>=123", "-F auid!=(unset|-1|4294967295)"};
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+
+    RemoveFile(file);
+    RemoveDir(dir);
+
+    ASSERT_TRUE(result.HasValue());
+    ASSERT_EQ(result.Value(), Status::Compliant);
+}
+
+TEST_F(AuditdRulesCheckTest, PersistentRulesUseNaturalOrderAndPrependActions)
+{
+    const std::string auditing = "-a always,exit -F arch=b64 -S execve\n";
+    const std::string suppressing = "-a never,exit -F arch=b64 -S execve\n";
+    std::string dir = MakeTempDir();
+    ASSERT_FALSE(dir.empty());
+    const std::string earlyFile = dir + "/2-audit.rules";
+    const std::string lateFile = dir + "/10-suppress.rules";
+    WriteFile(lateFile, suppressing);
+    WriteFile(earlyFile, auditing);
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+    AuditdRulesParams params;
+    params.searchItem = "-S execve";
+    params.requiredOptions.items = {"-F arch=b64", "-a (always,exit|exit,always)"};
+    for (bool prepend : {false, true})
+    {
+        SCOPED_TRACE(::testing::Message() << "prepend=" << prepend);
+        if (prepend)
+        {
+            WriteFile(lateFile, "-A never,exit -F arch=b64 -S execve\n");
+        }
+        EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(auditing)));
+        auto result = AuditAuditdRules(params, indicators, mContext);
+        ASSERT_TRUE(result.HasValue());
+        EXPECT_EQ(result.Value(), prepend ? Status::NonCompliant : Status::Compliant);
+    }
+    RemoveFile(earlyFile);
+    RemoveFile(lateFile);
+    RemoveDir(dir);
+}
+
+TEST_F(AuditdRulesCheckTest, EarlierDisjointSuppressionDoesNotInvalidateRule)
+{
+    const std::string rules =
+        "-a never,exit -F arch=b32 -S open -F exit=-EACCES\n"
+        "-a never,exit -F arch=b64 -S open -F exit=-EPERM\n"
+        "-a always,exit -F arch=b64 -S open -F exit=-EACCES\n";
+    EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(rules)));
+    std::string dir = MakeTempDir();
+    ASSERT_FALSE(dir.empty());
+    std::string file = dir + "/access.rules";
+    WriteFile(file, rules);
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+    AuditdRulesParams params;
+    params.searchItem = "-S open";
+    params.requiredOptions.items = {"-F arch=b64", "-a (always,exit|exit,always)", "-F exit=-EACCES"};
+    auto result = AuditAuditdRules(params, indicators, mContext);
+    RemoveFile(file);
+    RemoveDir(dir);
+    ASSERT_TRUE(result.HasValue());
+    EXPECT_EQ(result.Value(), Status::Compliant);
+}
+
+TEST_F(AuditdRulesCheckTest, SyscallPrefixDoesNotMatchLongerSyscall)
+{
+    const std::string rules =
+        "-a always,exit -F arch=b64 -S create_module -F auid>=1000 -F auid!=unset\n"
+        "-a always,exit -F arch=b64 -S creat -F exit=-EACCES -F auid>=1000 -F auid!=unset\n";
+    EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(rules)));
+
+    std::string dir = MakeTempDir();
+    ASSERT_FALSE(dir.empty());
+    std::string file = dir + "/access.rules";
+    WriteFile(file, rules);
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+
+    AuditdRulesParams params;
+    params.searchItem = "-S creat";
+    params.requiredOptions.items = {"-F arch=b64", "-a (always,exit|exit,always)", "-F exit=-EACCES", "-F auid>=123", "-F auid!=(unset|-1|4294967295)"};
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+
+    RemoveFile(file);
+    RemoveDir(dir);
+
+    ASSERT_TRUE(result.HasValue());
+    ASSERT_EQ(result.Value(), Status::Compliant);
+}
+
+TEST_F(AuditdRulesCheckTest, HighBitSyscallSuffixDoesNotSatisfyExactToken)
+{
+    const std::string rules = "-a always,exit -F arch=b64 -S unlink\x80 -F auid>=1000 -F auid!=unset\n";
+    EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(rules)));
+
+    std::string dir = MakeTempDir();
+    ASSERT_FALSE(dir.empty());
+    std::string file = dir + "/deletion.rules";
+    WriteFile(file, rules);
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+
+    AuditdRulesParams params;
+    params.searchItem = "-S unlink";
+    params.requiredOptions.items = {"-F arch=b64", "-a (always,exit|exit,always)"};
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+
+    RemoveFile(file);
+    RemoveDir(dir);
+
+    ASSERT_TRUE(result.HasValue());
+    EXPECT_EQ(result.Value(), Status::NonCompliant);
+}
+
+TEST_F(AuditdRulesCheckTest, SyscallMatchesTabAndEndOfLineBoundaries)
+{
+    const std::vector<std::string> ruleVariants = {"-a always,exit -F arch=b64 -S unlink\t-k deletion\n", "-a always,exit -F arch=b64 -S unlink\n"};
+    for (const auto& rules : ruleVariants)
+    {
+        EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(rules)));
+
+        std::string dir = MakeTempDir();
+        ASSERT_FALSE(dir.empty());
+        std::string file = dir + "/deletion.rules";
+        WriteFile(file, rules);
+        mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+
+        AuditdRulesParams params;
+        params.searchItem = "-S unlink";
+        params.requiredOptions.items = {"-F arch=b64", "-a (always,exit|exit,always)"};
+
+        auto result = AuditAuditdRules(params, indicators, mContext);
+
+        RemoveFile(file);
+        RemoveDir(dir);
+
+        ASSERT_TRUE(result.HasValue());
+        EXPECT_EQ(result.Value(), Status::Compliant) << rules;
+    }
+}
+
+TEST_F(AuditdRulesCheckTest, ParallelArchAndExitVariantsDoNotInvalidateRule)
+{
+    const std::string rules =
+        "-a always,exit -F arch=b64 -S open -F exit=-EPERM -F auid>=1000 -F auid!=unset\n"
+        "-a always,exit -F arch=b32 -S open -F exit=-EACCES -F auid>=1000 -F auid!=unset\n";
+    EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(rules)));
+
+    std::string dir = MakeTempDir();
+    ASSERT_FALSE(dir.empty());
+    std::string file = dir + "/access.rules";
+    WriteFile(file, rules);
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+
+    AuditdRulesParams params;
+    params.searchItem = "-S open";
+    params.requiredOptions.items = {"-F arch=b32", "-a (always,exit|exit,always)", "-F exit=-EACCES", "-F auid>=123", "-F auid!=(unset|-1|4294967295)"};
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+
+    RemoveFile(file);
+    RemoveDir(dir);
+
+    ASSERT_TRUE(result.HasValue());
+    ASSERT_EQ(result.Value(), Status::Compliant);
+}
+
+TEST_F(AuditdRulesCheckTest, SyscallListWithLongerSuffixStillMatchesExactToken)
+{
+    const std::string rules = "-a always,exit -F arch=b64 -S unlink,unlinkat,rename,renameat -F auid>=1000 -F auid!=unset\n";
+    EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(rules)));
+
+    std::string dir = MakeTempDir();
+    ASSERT_FALSE(dir.empty());
+    std::string file = dir + "/deletion.rules";
+    WriteFile(file, rules);
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+
+    AuditdRulesParams params;
+    params.searchItem = "-S unlink,unlinkat,rename,renameat";
+    params.requiredOptions.items = {"-F arch=b64", "-a (always,exit|exit,always)", "-F auid>=123", "-F auid!=(unset|-1|4294967295)"};
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+
+    RemoveFile(file);
+    RemoveDir(dir);
+
+    ASSERT_TRUE(result.HasValue());
+    ASSERT_EQ(result.Value(), Status::Compliant);
+}
+
+TEST_F(AuditdRulesCheckTest, LongerSyscallAloneDoesNotSatisfyExactToken)
+{
+    const std::string rules = "-a always,exit -F arch=b64 -S unlinkat,renameat -F auid>=1000 -F auid!=unset\n";
+    EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(rules)));
+
+    std::string dir = MakeTempDir();
+    ASSERT_FALSE(dir.empty());
+    std::string file = dir + "/deletion.rules";
+    WriteFile(file, rules);
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+
+    AuditdRulesParams params;
+    params.searchItem = "-S unlink";
+    params.requiredOptions.items = {"-F arch=b64", "-a (always,exit|exit,always)", "-F auid>=123", "-F auid!=(unset|-1|4294967295)"};
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+
+    RemoveFile(file);
+    RemoveDir(dir);
+
+    ASSERT_TRUE(result.HasValue());
+    ASSERT_EQ(result.Value(), Status::NonCompliant);
+}
+
+// Test: syscall search non-compliant when files missing required rule
+TEST_F(AuditdRulesCheckTest, SyscallSearchFilesMissingIsNonCompliant)
+{
+    EXPECT_CALL(mContext, ExecuteCommand("auditctl -l"))
+        .WillOnce(Return(Result<std::string>(std::string("-S mount -F arch=b64 -a always,exit -F auid>=1000 -F auid!=4294967295\n"))));
+
+    std::string dir = MakeTempDir();
+    ASSERT_FALSE(dir.empty());
+    std::string file = dir + "/sys.rules";
+    WriteFile(file, "# unrelated syscall\n-S umount -F arch=b64 -a always,exit -F auid>=1000 -F auid!=4294967295\n");
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+
+    AuditdRulesParams params;
+    params.searchItem = "-S mount";
+    params.requiredOptions.items = {"-F arch=b64:-a (always,exit|exit,always):-F auid>=123:-F auid!=(unset|-1|4294967295)"};
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+
+    RemoveFile(file);
+    RemoveDir(dir);
+
+    ASSERT_TRUE(result.HasValue());
+    ASSERT_EQ(result.Value(), Status::NonCompliant);
+}
+
+// Test: multi-syscall search where one missing in files -> NonCompliant
+TEST_F(AuditdRulesCheckTest, MultiSyscallOneMissingInFilesIsNonCompliant)
+{
+    EXPECT_CALL(mContext, ExecuteCommand("auditctl -l"))
+        .WillOnce(Return(Result<std::string>(std::string("-S mount -F arch=b64 -a always,exit -F auid>=1000 -F auid!=4294967295\n"
+                                                         "-S umount -F arch=b64 -a always,exit -F auid>=1000 -F auid!=4294967295\n"))));
+
+    std::string dir = MakeTempDir();
+    ASSERT_FALSE(dir.empty());
+    std::string file = dir + "/sys.rules";
+    // Only mount present in files, umount missing
+    WriteFile(file, "-S mount -F arch=b64 -a always,exit -F auid>=1000 -F auid!=4294967295\n");
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+
+    AuditdRulesParams params;
+    params.searchItem = "-S mount,umount";
+    params.requiredOptions.items = {"-F arch=b64:-a (always,exit|exit,always):-F auid>=123:-F auid!=(unset|-1|4294967295)"};
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+
+    RemoveFile(file);
+    RemoveDir(dir);
+
+    ASSERT_TRUE(result.HasValue());
+    ASSERT_EQ(result.Value(), Status::NonCompliant);
+}
+
+// Test: excludeOptions causes matching rules to be ignored leading to NonCompliant
+TEST_F(AuditdRulesCheckTest, ExcludeOptionsSkipsMatchingRules)
+{
+    EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(std::string("-w /var/log/secure -p wa -k badkey\n"))));
+
+    std::string dir = MakeTempDir();
+    ASSERT_FALSE(dir.empty());
+    std::string file = dir + "/watch.rules";
+    WriteFile(file, "-w /var/log/secure -p wa -k badkey\n");
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+
+    AuditdRulesParams params;
+    params.searchItem = "-w /var/log/secure";
+    params.requiredOptions.items = {"-p wa"};
+    params.excludeOption = "-k badkey";
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+
+    RemoveFile(file);
+    RemoveDir(dir);
+
+    ASSERT_TRUE(result.HasValue());
+    ASSERT_EQ(result.Value(), Status::NonCompliant);
+}
+
+// Test: SUDOLOGFILE resolved via sudoers with quotes, compliant when both present
+TEST_F(AuditdRulesCheckTest, SudoLogfileCompliantWithOverridePath)
+{
+    EXPECT_CALL(mContext, ExecuteCommand("grep -E '^[[:space:]]*[Dd]efaults.*logfile' /etc/sudoers 2>/dev/null | tail -1"))
+        .WillOnce(Return(Result<std::string>(std::string("Defaults logfile=\"/var/log/sudo/test.log\"\n"))));
+    EXPECT_CALL(mContext, ExecuteCommand("grep -h -E '^[[:space:]]*[Dd]efaults.*logfile' /etc/sudoers.d/* 2>/dev/null | tail -1"))
+        .WillRepeatedly(Return(Result<std::string>(std::string(""))));
+    EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(std::string("-w /var/log/sudo/test.log -p wa\n"))));
+
+    std::string dir = MakeTempDir();
+    ASSERT_FALSE(dir.empty());
+    std::string file = dir + "/sudo.rules";
+    WriteFile(file, "-w /var/log/sudo/test.log -p wa\n");
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+
+    AuditdRulesParams params;
+    params.searchItem = "SUDOLOGFILE";
+    params.requiredOptions.items = {"-p wa"};
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+
+    RemoveFile(file);
+    RemoveDir(dir);
+
+    ASSERT_TRUE(result.HasValue());
+    ASSERT_EQ(result.Value(), Status::Compliant);
+}
+
+// Test: SUDOLOGFILE non-compliant when file rule missing
+TEST_F(AuditdRulesCheckTest, SudoLogfileFilesMissingIsNonCompliant)
+{
+    EXPECT_CALL(mContext, ExecuteCommand("grep -E '^[[:space:]]*[Dd]efaults.*logfile' /etc/sudoers 2>/dev/null | tail -1"))
+        .WillOnce(Return(Result<std::string>(std::string("Defaults logfile=/var/log/audit/sudolog-test.log\n"))));
+    EXPECT_CALL(mContext, ExecuteCommand("grep -h -E '^[[:space:]]*[Dd]efaults.*logfile' /etc/sudoers.d/* 2>/dev/null | tail -1"))
+        .WillRepeatedly(Return(Result<std::string>(std::string(""))));
+    EXPECT_CALL(mContext, ExecuteCommand("auditctl -l"))
+        .WillOnce(Return(Result<std::string>(std::string("-w /var/log/audit/sudolog-test.log -p wa\n"))));
+
+    std::string dir = MakeTempDir();
+    ASSERT_FALSE(dir.empty());
+    std::string file = dir + "/sudo.rules";
+    WriteFile(file, "# no sudo logfile watch here\n");
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+
+    AuditdRulesParams params;
+    params.searchItem = "SUDOLOGFILE";
+    params.requiredOptions.items = {"-p wa"};
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+
+    RemoveFile(file);
+    RemoveDir(dir);
+
+    ASSERT_TRUE(result.HasValue());
+    ASSERT_EQ(result.Value(), Status::NonCompliant);
+}
+
+// Test: immutable rule (-e 2) compliant when present in files
+TEST_F(AuditdRulesCheckTest, ImmutableRuleCompliant)
+{
+    EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(std::string("No rules\n"))));
+
+    std::string dir = MakeTempDir();
+    ASSERT_FALSE(dir.empty());
+    std::string file = dir + "/immutable.rules";
+    WriteFile(file, "-e 2\n");
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+
+    AuditdRulesParams params;
+    params.searchItem = "-e 2";
+    params.requiredOptions.items = {".*"}; // allow any content for this simple line
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+
+    RemoveFile(file);
+    RemoveDir(dir);
+
+    ASSERT_TRUE(result.HasValue());
+    ASSERT_EQ(result.Value(), Status::Compliant);
+}
+
+// Test: immutable rule (-e 2) non-compliant when missing in files
+TEST_F(AuditdRulesCheckTest, ImmutableRuleMissingIsNonCompliant)
+{
+    EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(std::string("No rules\n"))));
+
+    std::string dir = MakeTempDir();
+    ASSERT_FALSE(dir.empty());
+    std::string file = dir + "/immutable.rules";
+    WriteFile(file, "# empty file, no -e 2\n");
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+
+    AuditdRulesParams params;
+    params.searchItem = "-e 2";
+    params.requiredOptions.items = {".*"};
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+
+    RemoveFile(file);
+    RemoveDir(dir);
+
+    ASSERT_TRUE(result.HasValue());
+    ASSERT_EQ(result.Value(), Status::NonCompliant);
+}
+
+// Test: running rule present but missing required options -> NonCompliant even if files have proper rule
+TEST_F(AuditdRulesCheckTest, RunningRuleMissingRequiredOptionsIsNonCompliant)
+{
+    EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(std::string("-w /etc/sudoers -p w\n"))));
+
+    std::string dir = MakeTempDir();
+    ASSERT_FALSE(dir.empty());
+    std::string file = dir + "/watch.rules";
+    WriteFile(file, "-w /etc/sudoers -p wa\n");
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+
+    AuditdRulesParams params;
+    params.searchItem = "-w /etc/sudoers";
+    params.requiredOptions.items = {"-p wa"};
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+
+    RemoveFile(file);
+    RemoveDir(dir);
+
+    ASSERT_TRUE(result.HasValue());
+    ASSERT_EQ(result.Value(), Status::NonCompliant);
+}
+
+// Test: running rules empty but files contain matching rule -> NonCompliant (running checked first)
+TEST_F(AuditdRulesCheckTest, RunningRulesEmptyButFileMatchesIsNonCompliant)
+{
+    EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(std::string("No rules\n"))));
+
+    std::string dir = MakeTempDir();
+    ASSERT_FALSE(dir.empty());
+    std::string file = dir + "/watch.rules";
+    WriteFile(file, "-w /etc/sudoers -p wa\n");
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+
+    AuditdRulesParams params;
+    params.searchItem = "-w /etc/sudoers";
+    params.requiredOptions.items = {"-p wa"};
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+
+    RemoveFile(file);
+    RemoveDir(dir);
+
+    ASSERT_TRUE(result.HasValue());
+    ASSERT_EQ(result.Value(), Status::NonCompliant);
+}
+
+// Test: SUDOLOGFILE not found in sudoers or sudoers.d -> returns NonCompliant
+TEST_F(AuditdRulesCheckTest, SudoLogfileNotFoundReturnsFailure)
+{
+    EXPECT_CALL(mContext, ExecuteCommand("grep -E '^[[:space:]]*[Dd]efaults.*logfile' /etc/sudoers 2>/dev/null | tail -1"))
+        .WillOnce(Return(Result<std::string>(std::string(""))));
+    EXPECT_CALL(mContext, ExecuteCommand("grep -h -E '^[[:space:]]*[Dd]efaults.*logfile' /etc/sudoers.d/* 2>/dev/null | tail -1"))
+        .WillOnce(Return(Result<std::string>(std::string(""))));
+    EXPECT_CALL(mContext, ExecuteCommand("auditctl -l")).WillOnce(Return(Result<std::string>(std::string("No rules\n"))));
+
+    std::string dir = MakeTempDir();
+    ASSERT_FALSE(dir.empty());
+    mContext.SetSpecialFilePath("/etc/audit/rules.d", dir);
+
+    AuditdRulesParams params;
+    params.searchItem = "SUDOLOGFILE";
+    params.requiredOptions.items = {"-p wa"};
+
+    auto result = AuditAuditdRules(params, indicators, mContext);
+
+    RemoveDir(dir);
+
+    ASSERT_TRUE(result.HasValue());
+    ASSERT_EQ(result.Value(), Status::NonCompliant);
+}

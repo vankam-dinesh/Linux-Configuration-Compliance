@@ -1,0 +1,40 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+#ifndef INTERNAL_H
+#define INTERNAL_H
+
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <stdarg.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <sys/file.h>
+#include <unistd.h>
+#include <ctype.h>
+#include <time.h>
+#include <dirent.h>
+#include <parson.h>
+#include <Logging.h>
+#include <Reasons.h>
+#include <CommonUtils.h>
+#include <version.h>
+
+#if ((__GLIBC__ == 2) && (__GLIBC_MINOR__ < 30))
+#include <sys/syscall.h>
+#define gettid() syscall(SYS_gettid)
+#endif
+
+#define INT_ENOENT -999
+
+#define MAX_STRING_LENGTH 512
+
+#endif // INTERNAL_H

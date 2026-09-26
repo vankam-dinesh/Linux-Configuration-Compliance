@@ -1,0 +1,33 @@
+name: Code Formatting
+
+on: [push, pull_request, merge_group]
+
+# Cancel any in-progress run for the same branch/PR when a new push arrives.
+# This prevents stale runs (e.g. from before a force-push) from continuing to
+# execute against files that no longer exist in the repository.
+# Include event_name so that a push to the merge-queue temporary branch does
+# not share a concurrency group with the merge_group event for the same ref,
+# which would cause one to cancel the other and leave the required check unreported.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  code-formatting:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Set up Python 3.8
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: 3.8
+      - name: Install clang tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format clang-tidy
+          yes | devops/scripts/run-hooks.sh --install
+          devops/scripts/run-hooks.sh --all-files

@@ -1,0 +1,69 @@
+name: Publish (prod)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to publish'
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish
+    uses: ./.github/workflows/publish-pmc.yml
+    strategy:
+      matrix:
+        target:
+          [
+            { os: debian, version: 10, arch: amd64, dist: buster, package-type: DEB, repo: microsoft-debian-buster-prod-apt },
+            { os: debian, version: 10, arch: arm64, dist: buster, package-type: DEB, repo: microsoft-debian-buster-prod-apt },
+            { os: debian, version: 12, arch: amd64, dist: bookworm, package-type: DEB, repo: microsoft-debian-bookworm-prod-apt },
+            { os: debian, version: 12, arch: arm64, dist: bookworm, package-type: DEB, repo: microsoft-debian-bookworm-prod-apt },
+            { os: ubuntu, version: 20.04, arch: amd64, dist: focal, package-type: DEB, repo: microsoft-ubuntu-focal-prod-apt },
+            { os: ubuntu, version: 20.04, arch: arm64, dist: focal, package-type: DEB, repo: microsoft-ubuntu-focal-prod-apt },
+            { os: ubuntu, version: 22.04, arch: amd64, dist: jammy, package-type: DEB, repo: microsoft-ubuntu-jammy-prod-apt },
+            { os: ubuntu, version: 22.04, arch: arm64, dist: jammy, package-type: DEB, repo: microsoft-ubuntu-jammy-prod-apt },
+          ]
+    with:
+      target: ${{ matrix.target.os }}-${{ matrix.target.version }}
+      arch: ${{ matrix.target.arch }}
+      repo: ${{ matrix.target.repo }}
+      dist: ${{ matrix.target.dist }}
+      environment: prod
+      # ESRP debian based repos (deb) have channels/rings on repos.
+      # ESRP yum based repos (rpm) have no channels
+      channel: ${{ matrix.target.package-type == 'DEB' && matrix.target.dist || '' }}
+      package-type: ${{ matrix.target.package-type }}
+    secrets: inherit
+
+  release:
+    if: false
+    name: Release
+    needs: publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: '*-signed'
+          path: packages
+
+      - name: Create release
+        working-directory: packages
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          gh release create ${{ github.ref_name }} \
+            --repo ${{ github.repository }} \
+            --title "${{ github.ref_name }}" \
+            --target ${{ github.sha }} \
+            --generate-notes \
+            --latest \
+            *.deb

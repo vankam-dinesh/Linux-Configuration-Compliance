@@ -1,0 +1,22 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+cmake_minimum_required(VERSION 3.21)
+
+# Set the project name and version
+project(kompli-fuzzer)
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=fuzzer")
+
+add_executable(kompli-fuzzer
+    RegexFallbackTarget.cpp
+    target.cpp)
+target_link_libraries(kompli-fuzzer PRIVATE
+    complianceenginelib
+    commonutils
+    $<$<BOOL:${BUILD_TELEMETRY}>:telemetry-interface>
+)
+
+if(BUILD_TELEMETRY)
+    add_dependencies(kompli-fuzzer telemetry-external)
+endif()

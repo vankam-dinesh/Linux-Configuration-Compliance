@@ -1,0 +1,89 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "audit": {
+      "anyOf": [
+        {
+          "type": "object",
+          "required": [
+            "FilesystemMountOption"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "FilesystemMountOption": {
+              "type": "object",
+              "required": [
+                "mountpoint"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "mountpoint": {
+                  "type": "string",
+                  "description": "Filesystem mount point"
+                },
+                "mountpointIsPattern": {
+                  "type": "string",
+                  "description": "Treat mountpoint as a regular expression and audit every matching mounted filesystem; remediation is not supported in this mode"
+                },
+                "requireMountpoint": {
+                  "type": "string",
+                  "description": "Fail the audit when no mounted filesystem matches mountpoint; otherwise a missing mount is compliant"
+                },
+                "optionsSet": {
+                  "type": "string",
+                  "description": "Comma-separated list of options that must be set"
+                },
+                "optionsNotSet": {
+                  "type": "string",
+                  "description": "Comma-separated list of options that must not be set"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "remediation": {
+      "anyOf": [
+        {
+          "type": "object",
+          "required": [
+            "FilesystemMountOption"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "FilesystemMountOption": {
+              "type": "object",
+              "required": [
+                "mountpoint"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "mountpoint": {
+                  "type": "string",
+                  "description": "Filesystem mount point"
+                },
+                "mountpointIsPattern": {
+                  "type": "string",
+                  "description": "Treat mountpoint as a regular expression and audit every matching mounted filesystem; remediation is not supported in this mode"
+                },
+                "requireMountpoint": {
+                  "type": "string",
+                  "description": "Fail the audit when no mounted filesystem matches mountpoint; otherwise a missing mount is compliant"
+                },
+                "optionsSet": {
+                  "type": "string",
+                  "description": "Comma-separated list of options that must be set"
+                },
+                "optionsNotSet": {
+                  "type": "string",
+                  "description": "Comma-separated list of options that must not be set"
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

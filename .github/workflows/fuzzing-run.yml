@@ -1,0 +1,100 @@
+name: Fuzzer execution
+
+on:
+  workflow_call:
+    inputs:
+      build_target:
+        required: true
+        type: string
+      arch:
+        required: true
+        type: string
+      package-type:
+        required: true
+        type: string
+      timeout-seconds:
+        description: The maximum time in seconds to run the fuzzer.
+        required: false
+        type: number
+        default: 600
+      container-tag:
+        type: string
+        required: false
+        default: latest
+      execute:
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  MOUNT: /kompli
+  REGISTRY: ghcr.io
+
+jobs:
+  package:
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/package-build.yml
+    with:
+      build_target: ${{ inputs.build_target }}
+      arch: ${{ inputs.arch }}
+      artifact: ${{ inputs.build_target }}-fuzzer
+      package-type: ${{ inputs.package-type }}
+      build-fuzzers: true
+      container-tag: ${{ inputs.container-tag }}
+
+  fuzzer-execution:
+    if: ${{ inputs.execute }}
+    needs: package
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        id: download
+        with:
+          name: ${{ inputs.build_target }}-fuzzer
+
+      - name: Run container
+        id: container
+        uses: ./.github/actions/container-run
+        with:
+          registry: ${{ env.REGISTRY }}
+          container: microsoft/kompli/${{ inputs.build_target }}-${{ inputs.arch }}
+          mount: ${{ github.workspace }}:${{ env.MOUNT }}
+          tag: ${{ inputs.container-tag }}
+
+      - name: Install prerequisites
+        uses: ./.github/actions/container-exec
+        with:
+          container: ${{ steps.container.outputs.id }}
+          working-directory: ${{ env.MOUNT }}/tests/fuzzer
+          cmd: mkdir -p ${{ env.MOUNT }}/output/artifacts && mkdir /tmp/corpus && cp -r ${{ env.MOUNT }}/src/tests/fuzzer/seed_corpus/* /tmp/corpus && chmod u+x ./kompli-fuzzer
+
+      - name: Run kompli-fuzzer
+        uses: ./.github/actions/container-exec
+        with:
+          container: ${{ steps.container.outputs.id }}
+          working-directory: ${{ env.MOUNT }}/tests/fuzzer
+          cmd: set -o pipefail && LSAN_OPTIONS=suppressions=${{ env.MOUNT }}/src/tests/fuzzer/lsan.suppressions ./kompli-fuzzer -artifact_prefix=${{ env.MOUNT }}/output/artifacts/ -max_total_time=${{ inputs.timeout-seconds }} /tmp/corpus 2>&1 >/dev/null | tee ${{ env.MOUNT }}/output/kompli-fuzzer.log
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: success() || failure()
+        with:
+          name: ${{ inputs.build_target }}-logs
+          path: ${{ github.workspace }}/output

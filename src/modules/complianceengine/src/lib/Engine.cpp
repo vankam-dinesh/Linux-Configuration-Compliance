@@ -1,0 +1,367 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+#include "Engine.h"
+
+#include "Base64.h"
+#include "DirTools.h"
+#include "Evaluator.h"
+#include "JsonWrapper.h"
+#include "Logging.h"
+#include "Optional.h"
+#include "Procedure.h"
+#include "Result.h"
+
+#include <cerrno>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <parson.h>
+#include <string>
+#include <sys/stat.h>
+#include <utility>
+
+namespace ComplianceEngine
+{
+static constexpr const char* cModuleInfo =
+    "{\"Name\": \"ComplianceEngine\","
+    "\"Description\": \"Provides functionality to audit and remediate Security Baseline policies on device\","
+    "\"Manufacturer\": \"Microsoft\","
+    "\"VersionMajor\": 0,"
+    "\"VersionMinor\": 0,"
+    "\"VersionInfo\": \"\","
+    "\"Components\": [\"ComplianceEngine\"],"
+    "\"Lifetime\": 2,"
+    "\"UserAccount\": 0}";
+
+Engine::Engine(std::unique_ptr<ContextInterface> context, std::unique_ptr<PayloadFormatter> payloadFormatter)
+    : mContext{std::move(context)},
+      mFormatter{std::move(payloadFormatter)},
+      mDistributionInfo{Error("Distribution info has not been loaded")}
+{
+}
+
+void Engine::SetMaxPayloadSize(unsigned int value) noexcept
+{
+    mMaxPayloadSize = value;
+}
+
+unsigned int Engine::GetMaxPayloadSize() const noexcept
+{
+    return mMaxPayloadSize;
+}
+
+OsConfigLogHandle Engine::Log() const noexcept
+{
+    return mContext->GetLogHandle();
+}
+
+Telemetry& Engine::GetTelemetry() noexcept
+{
+    return mContext->GetTelemetry();
+}
+
+ContextInterface& Engine::GetContext() noexcept
+{
+    return *mContext;
+}
+
+Optional<Error> Engine::LoadDistributionInfo()
+{
+    struct stat st;
+    if (0 == stat(DistributionInfo::cDefaultOverrideFilePath, &st))
+    {
+        // Override file exists, use it as distribution info source
+        OsConfigLogDebug(Log(), "ComplianceEngineValidatePayload: Using %s for distribution info", DistributionInfo::cDefaultOverrideFilePath);
+        auto overrideInfo = DistributionInfo::ParseOverrideFile(DistributionInfo::cDefaultOverrideFilePath);
+        mDistributionInfo = std::move(overrideInfo);
+        if (!mDistributionInfo.HasValue())
+        {
+            OsConfigLogError(Log(), "ComplianceEngineValidatePayload failed to parse %s: %s", DistributionInfo::cDefaultOverrideFilePath,
+                mDistributionInfo.Error().message.c_str());
+            return mDistributionInfo.Error();
+        }
+    }
+    else if (ENOENT == errno)
+    {
+        // Override file does not exist, use /etc/os-release
+        OsConfigLogDebug(Log(), "ComplianceEngineValidatePayload: Using %s for distribution info", DistributionInfo::cDefaultEtcOsReleasePath);
+        auto osReleaseInfo = DistributionInfo::ParseEtcOsRelease(DistributionInfo::cDefaultEtcOsReleasePath);
+        mDistributionInfo = std::move(osReleaseInfo);
+        if (!mDistributionInfo.HasValue())
+        {
+            OsConfigLogError(Log(), "ComplianceEngineValidatePayload failed to parse %s: %s", DistributionInfo::cDefaultEtcOsReleasePath,
+                mDistributionInfo.Error().message.c_str());
+            return mDistributionInfo.Error();
+        }
+    }
+    else
+    {
+        int status = errno;
+        OsConfigLogError(Log(), "ComplianceEngineValidatePayload failed to access %s: %s", DistributionInfo::cDefaultOverrideFilePath, strerror(status));
+        mDistributionInfo = Error("Failed to access override file", status);
+        return mDistributionInfo.Error();
+    }
+
+    return Optional<Error>();
+}
+
+const Result<DistributionInfo>& Engine::GetDistributionInfo() const noexcept
+{
+    return mDistributionInfo;
+}
+
+std::map<std::string, std::string> Engine::GetParameters(const std::string& ruleName) const
+{
+    auto it = mDatabase.find(ruleName);
+    if (it == mDatabase.end())
+    {
+        return {};
+    }
+    return it->second.Parameters();
+}
+
+const char* Engine::GetModuleInfo() noexcept
+{
+    return cModuleInfo;
+}
+
+Result<AuditResult> Engine::MmiGet(const char* objectName)
+{
+    if (nullptr == objectName)
+    {
+        return Error("Invalid argument", EINVAL);
+    }
+
+    OsConfigLogDebug(Log(), "Engine::mmiGet(%s)", objectName);
+    auto ruleName = std::string(objectName);
+    constexpr const char* auditPrefix = "audit";
+    if (ruleName.find(auditPrefix) != 0)
+    {
+        return Error("Invalid object name", EINVAL);
+    }
+
+    ruleName = ruleName.substr(strlen(auditPrefix));
+    if (ruleName.empty())
+    {
+        return Error("Rule name is empty", EINVAL);
+    }
+
+    auto it = mDatabase.find(ruleName);
+    if (it == mDatabase.end())
+    {
+        return Error("Rule not found", EINVAL);
+    }
+    const auto& procedure = it->second;
+    if (nullptr == procedure.Audit())
+    {
+        return Error("Failed to get 'audit' object");
+    }
+
+    Evaluator evaluator(ruleName, procedure.Audit(), procedure.Parameters(), *mContext);
+    Result<AuditResult> result = RunWithTelemetry(TelemetryEvent(TelemetryEventType::Audit, ruleName), mContext->GetTelemetry(), Log(),
+        [&]() { return evaluator.ExecuteAudit(*mFormatter); });
+    return result;
+}
+
+Optional<Error> Engine::SetProcedure(const std::string& ruleName, const std::string& payload)
+{
+    if (ruleName.empty())
+    {
+        return Error("Rule name is empty", EINVAL);
+    }
+
+    mDatabase.erase(ruleName);
+    auto ruleJSON = JsonWrapper::FromBase64(payload);
+    if (!ruleJSON.HasValue())
+    {
+        // Fall back to plain JSON, both formats are supported
+        ruleJSON = JsonWrapper::FromString(payload);
+        if (!ruleJSON.HasValue())
+        {
+            OsConfigLogError(Log(), "Failed to parse JSON: %s", ruleJSON.Error().message.c_str());
+            return ruleJSON.Error();
+        }
+    }
+
+    auto object = json_value_get_object(ruleJSON.Value().get());
+    if (nullptr == object)
+    {
+        return Error("Failed to parse JSON object");
+    }
+
+    auto jsonValue = json_object_get_value(object, "audit");
+    if (nullptr == jsonValue)
+    {
+        return Error("Missing 'audit' object");
+    }
+
+    if (json_value_get_type(jsonValue) != JSONObject)
+    {
+        return Error("The 'audit' value is not an object");
+    }
+
+    auto procedure = Procedure{};
+    auto error = procedure.SetAudit(jsonValue);
+    if (error)
+    {
+        return error.Value();
+    }
+    if (nullptr == procedure.Audit())
+    {
+        OsConfigLogError(Log(), "Failed to copy 'audit' object");
+        return Error("Out of memory");
+    }
+
+    jsonValue = json_object_get_value(object, "remediate");
+    if (nullptr != jsonValue)
+    {
+        if (json_value_get_type(jsonValue) != JSONObject)
+        {
+            return Error("The 'remediate' value is not an object");
+        }
+
+        error = procedure.SetRemediation(jsonValue);
+        if (error)
+        {
+            return error.Value();
+        }
+        if (nullptr == procedure.Remediation())
+        {
+            OsConfigLogError(Log(), "Failed to copy 'remediate' object");
+            return Error("Out of memory");
+        }
+    }
+
+    jsonValue = json_object_get_value(object, "parameters");
+    if (nullptr != jsonValue)
+    {
+        if (json_value_get_type(jsonValue) != JSONObject)
+        {
+            return Error("The 'parameters' value is not an object");
+        }
+
+        const auto* paramsObj = json_value_get_object(jsonValue);
+        if (nullptr == paramsObj)
+        {
+            OsConfigLogError(Log(), "Failed to parse 'parameters' object");
+            return Error("The 'parameters' object is null");
+        }
+
+        auto parameters = ProcedureParameters::Parse(*paramsObj);
+        if (!parameters.HasValue())
+        {
+            OsConfigLogError(Log(), "Failed to parse procedure parameters: %s", parameters.Error().message.c_str());
+            return parameters.Error();
+        }
+
+        procedure.SetParameters(std::move(parameters.Value()));
+    }
+    mDatabase.emplace(std::move(ruleName), std::move(procedure));
+    return Optional<Error>();
+}
+
+Optional<Error> Engine::InitAudit(const std::string& ruleName, const std::string& payload)
+{
+    if (ruleName.empty())
+    {
+        return Error("Rule name is empty", EINVAL);
+    }
+
+    auto it = mDatabase.find(ruleName);
+    if (it == mDatabase.end())
+    {
+        return Error("Out-of-order operation: procedure must be set first", EINVAL);
+    }
+
+    auto error = it->second.UpdateUserParameters(payload);
+    if (error)
+    {
+        OsConfigLogError(Log(), "ERROR: Failed to update user parameters: %s", error->message.c_str());
+        return error.Value();
+    }
+
+    return Optional<Error>();
+}
+
+Result<Status> Engine::ExecuteRemediation(const std::string& ruleName, const std::string& payload)
+{
+    if (ruleName.empty())
+    {
+        return Error("Rule name is empty", EINVAL);
+    }
+
+    auto it = mDatabase.find(ruleName);
+    if (it == mDatabase.end())
+    {
+        return Error("Out-of-order operation: procedure must be set first", EINVAL);
+    }
+    auto& procedure = it->second;
+    auto remediation = procedure.Remediation();
+    if (nullptr == remediation)
+    {
+        OsConfigLogInfo(Log(), "No 'remediate' object found, falling back to 'audit' object for remediation");
+        remediation = procedure.Audit();
+    }
+    if (nullptr == remediation)
+    {
+        return Error("Failed to get 'remediate' or 'audit' object");
+    }
+
+    auto error = procedure.UpdateUserParameters(payload);
+    if (error)
+    {
+        return error.Value();
+    }
+
+    Evaluator evaluator(ruleName, remediation, procedure.Parameters(), *mContext);
+    Result<Status> result = RunWithTelemetry(TelemetryEvent(TelemetryEventType::Remediation, ruleName), mContext->GetTelemetry(), Log(),
+        [&]() { return evaluator.ExecuteRemediation(); });
+    return result;
+}
+
+Result<Status> Engine::MmiSet(const char* objectName, const std::string& payload)
+{
+    if (nullptr == objectName)
+    {
+        OsConfigLogError(Log(), "Object name is null");
+        return Error("Invalid argument", EINVAL);
+    }
+
+    OsConfigLogDebug(Log(), "Engine::MmiSet(%s, %s)", objectName, payload.c_str());
+    constexpr const char* remediatePrefix = "remediate";
+    constexpr const char* initPrefix = "init";
+    constexpr const char* procedurePrefix = "procedure";
+    auto ruleName = std::string(objectName);
+    if (ruleName.find(procedurePrefix) == 0)
+    {
+        auto error = SetProcedure(ruleName.substr(strlen(procedurePrefix)), payload);
+        if (error)
+        {
+            return error.Value();
+        }
+
+        return Status::Compliant;
+    }
+
+    if (ruleName.find(initPrefix) == 0)
+    {
+        auto error = InitAudit(ruleName.substr(strlen(initPrefix)), payload);
+        if (error)
+        {
+            OsConfigLogInfo(Log(), "Failed to init audit: %s", error->message.c_str());
+            return error.Value();
+        }
+
+        return Status::Compliant;
+    }
+
+    if (ruleName.find(remediatePrefix) == 0)
+    {
+        return ExecuteRemediation(ruleName.substr(strlen(remediatePrefix)), payload);
+    }
+
+    OsConfigLogError(Log(), "Invalid object name: Must start with %s, %s or %s prefix", initPrefix, procedurePrefix, remediatePrefix);
+    return Error("Invalid object name");
+}
+} // namespace ComplianceEngine

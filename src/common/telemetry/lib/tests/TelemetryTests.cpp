@@ -1,0 +1,186 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+#include <Telemetry.hpp>
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <gtest/gtest.h>
+#include <thread>
+
+class TelemetryTest : public ::testing::Test
+{
+protected:
+    std::string m_testDir;
+    std::string m_testJsonFile;
+    std::string m_telemetryCache;
+
+    void SetUp() override
+    {
+        // Create a temporary directory for test files
+        char tmpDir[] = "/tmp/telemetry_test_XXXXXX";
+        ASSERT_NE(nullptr, mkdtemp(tmpDir));
+        m_testDir = std::string(tmpDir);
+        m_testJsonFile = m_testDir + "/test_telemetry.json";
+
+        std::string telemetryCache = m_testDir + "/telemetry_cache_db.XXXXXX";
+        std::vector<char> buffer(telemetryCache.begin(), telemetryCache.end());
+        buffer.push_back('\0');
+
+        int fd = ::mkstemp(buffer.data());
+        EXPECT_TRUE(0 < fd);
+        m_telemetryCache.assign(buffer.data(), buffer.size());
+    }
+
+    void TearDown() override
+    {
+        // Clean up test directory
+        if (!m_testDir.empty())
+        {
+            std::string cmd = "rm -rf " + m_testDir;
+            auto ret = system(cmd.c_str());
+            (void)ret;
+        }
+    }
+
+    // Helper function to create a test JSON file
+    bool CreateTestJsonFile(const std::string& content)
+    {
+        std::ofstream file(m_testJsonFile);
+        if (!file.is_open())
+        {
+            return false;
+        }
+        file << content;
+        file.close();
+        return true;
+    }
+};
+
+// Test processing a non-existent file
+TEST_F(TelemetryTest, ProcessNonExistentFile)
+{
+    Telemetry::TelemetryManager telemetryManager(m_telemetryCache, false, std::chrono::seconds(1), true, nullptr);
+    EXPECT_FALSE(telemetryManager.ProcessJsonFile("/non/existent/file.json"));
+}
+
+// Test processing an empty file
+TEST_F(TelemetryTest, ProcessEmptyFile)
+{
+    ASSERT_TRUE(CreateTestJsonFile(""));
+    Telemetry::TelemetryManager telemetryManager(m_telemetryCache, false, std::chrono::seconds(1), true, nullptr);
+    EXPECT_TRUE(telemetryManager.ProcessJsonFile(m_testJsonFile)); // Empty file should be processed successfully
+}
+
+// Test processing a file with valid JSON lines
+TEST_F(TelemetryTest, ProcessValidJsonFile)
+{
+    // Create a test file with a valid event
+    std::string validJson = R"({"EventName": "TestEvent", "TestParam": "value"})";
+    ASSERT_TRUE(CreateTestJsonFile(validJson));
+    Telemetry::TelemetryManager telemetryManager(m_telemetryCache, false, std::chrono::seconds(1), true, nullptr);
+    EXPECT_FALSE(telemetryManager.ProcessJsonFile(m_testJsonFile));
+}
+
+// Test processing a file with invalid JSON
+TEST_F(TelemetryTest, ProcessInvalidJsonFile)
+{
+    ASSERT_TRUE(CreateTestJsonFile("invalid json content"));
+    Telemetry::TelemetryManager telemetryManager(m_telemetryCache, false, std::chrono::seconds(1), true, nullptr);
+    EXPECT_FALSE(telemetryManager.ProcessJsonFile(m_testJsonFile));
+}
+
+// Test processing a file with mixed valid and invalid JSON lines
+TEST_F(TelemetryTest, ProcessMixedJsonFile)
+{
+    std::string mixedContent = R"({"EventName": "TestEvent", "TestParam": "value"}
+invalid json line
+{"EventName": "AnotherEvent", "Param": "value2"})";
+    ASSERT_TRUE(CreateTestJsonFile(mixedContent));
+    Telemetry::TelemetryManager telemetryManager(m_telemetryCache, false, std::chrono::seconds(1), true, nullptr);
+    EXPECT_FALSE(telemetryManager.ProcessJsonFile(m_testJsonFile));
+}
+
+// Test processing a file with multiple valid JSON lines
+TEST_F(TelemetryTest, ProcessMultipleValidJsonLines)
+{
+    std::string multipleLines = R"({"EventName": "Event1", "Param1": "value1"}
+{"EventName": "Event2", "Param2": "value2"}
+{"EventName": "Event3", "Param3": "value3"})";
+    ASSERT_TRUE(CreateTestJsonFile(multipleLines));
+    Telemetry::TelemetryManager telemetryManager(m_telemetryCache, false, std::chrono::seconds(1), true, nullptr);
+    EXPECT_FALSE(telemetryManager.ProcessJsonFile(m_testJsonFile));
+}
+
+// Test events
+TEST_F(TelemetryTest, ProcessRuleCompleteEvent)
+{
+    std::string realEvent =
+        R"({"EventName":"RuleComplete","Timestamp":"2025-10-17 22:52:56+0000","ComponentName":"ComplianceEngine","ObjectName":"auditEnsureAuditdInstalled","ObjectResult":"0","Microseconds":"29","DistroName":"CentOS","CorrelationId":"","Version":"1.0.5.20251017-g03b36b7d"})";
+    ASSERT_TRUE(CreateTestJsonFile(realEvent));
+    Telemetry::TelemetryManager telemetryManager(m_telemetryCache, false, std::chrono::seconds(1), true, nullptr);
+    EXPECT_TRUE(telemetryManager.ProcessJsonFile(m_testJsonFile));
+}
+
+TEST_F(TelemetryTest, ProcessRuleCompleteMissingComponentNameEvent)
+{
+    std::string realEvent =
+        R"({"EventName":"RuleComplete","Timestamp":"2025-10-17 22:52:56+0000","ComponentName":"ComplianceEngine","ObjectResult":"0","Microseconds":"29","DistroName":"CentOS","CorrelationId":"","Version":"1.0.5.20251017-g03b36b7d"})";
+    ASSERT_TRUE(CreateTestJsonFile(realEvent));
+    Telemetry::TelemetryManager telemetryManager(m_telemetryCache, false, std::chrono::seconds(1), true, nullptr);
+    EXPECT_FALSE(telemetryManager.ProcessJsonFile(m_testJsonFile));
+}
+
+TEST_F(TelemetryTest, ProcessBaselineRunEvent)
+{
+    std::string realEvent =
+        R"({"EventName":"BaselineRun","Timestamp":"2025-10-17 22:52:56+0000","BaselineName":"Azure Security Baseline for Linux","Mode":"audit-only","DurationSeconds":"8.87","DistroName":"CentOS","CorrelationId":"","Version":"1.0.5.20251017-g03b36b7d"})";
+    ASSERT_TRUE(CreateTestJsonFile(realEvent));
+    Telemetry::TelemetryManager telemetryManager(m_telemetryCache, false, std::chrono::seconds(1), true, nullptr);
+    EXPECT_TRUE(telemetryManager.ProcessJsonFile(m_testJsonFile));
+}
+
+TEST_F(TelemetryTest, ProcessBaselineRunMissingTimestampEvent)
+{
+    std::string realEvent =
+        R"({"EventName":"BaselineRun","BaselineName":"Azure Security Baseline for Linux","Mode":"audit-only","DurationSeconds":"8.87","DistroName":"CentOS","CorrelationId":"","Version":"1.0.5.20251017-g03b36b7d"})";
+    ASSERT_TRUE(CreateTestJsonFile(realEvent));
+    Telemetry::TelemetryManager telemetryManager(m_telemetryCache, false, std::chrono::seconds(1), true, nullptr);
+    EXPECT_FALSE(telemetryManager.ProcessJsonFile(m_testJsonFile));
+}
+
+TEST_F(TelemetryTest, ProcessStatusTraceEvent)
+{
+    std::string realEvent =
+        R"({"EventName":"StatusTrace","Timestamp":"2025-10-17 22:52:56+0000","FileName":"/workspaces/azure-osconfig/src/modules/complianceengine/src/lib/Engine.cpp","LineNumber":"1109","FunctionName":"Evaluate","RuleCodename":"auditEnsureSmbWithSambaIsDisabled","CallingFunctionName":"TestingStatusTrace","ResultCode":"0","ResultString":"OK","ScenarioName":"TestingScenario","Microseconds":"101807","DistroName":"CentOS","CorrelationId":"","Version":"1.0.5.20251017-g03b36b7d"})";
+    ASSERT_TRUE(CreateTestJsonFile(realEvent));
+    Telemetry::TelemetryManager telemetryManager(m_telemetryCache, false, std::chrono::seconds(1), true, nullptr);
+    EXPECT_TRUE(telemetryManager.ProcessJsonFile(m_testJsonFile));
+}
+
+TEST_F(TelemetryTest, ProcessStatusTraceMissingScenarioNameEvent)
+{
+    std::string realEvent =
+        R"({"EventName":"StatusTrace","Timestamp":"2025-10-17 22:52:56+0000","FileName":"/workspaces/azure-osconfig/src/modules/complianceengine/src/lib/Engine.cpp","LineNumber":"1109","FunctionName":"Evaluate","RuleCodename":"auditEnsureSmbWithSambaIsDisabled","CallingFunctionName":"TestingStatusTrace","ResultCode":"0","Microseconds":"101807","DistroName":"CentOS","CorrelationId":"","Version":"1.0.5.20251017-g03b36b7d"})";
+    ASSERT_TRUE(CreateTestJsonFile(realEvent));
+    Telemetry::TelemetryManager telemetryManager(m_telemetryCache, false, std::chrono::seconds(1), true, nullptr);
+    EXPECT_FALSE(telemetryManager.ProcessJsonFile(m_testJsonFile));
+}
+
+TEST_F(TelemetryTest, ProcessCommandExecutedEvent)
+{
+    std::string realEvent =
+        R"({"EventName":"CommandExecuted","DistroName":"CentOS","Version":"1.3.0-preview123","CorrelationId":"{00000000-0000-0000-0000-000000000000}","CorrelationGroup":"TestGroup","Timestamp":"2025-10-17 22:52:56+0000","IsTestMode":true,"Subcommand":"get resource","Duration":1234.5678,"Success":true,"ErrorKind":"Resource","ErrorResourceName":"Test Resource","ErrorResourceType":"Microsoft.OSConfig/Test","ErrorLocation":"utils/test.rs:123","ErrorCode":1})";
+    ASSERT_TRUE(CreateTestJsonFile(realEvent));
+    Telemetry::TelemetryManager telemetryManager(m_telemetryCache, false, std::chrono::seconds(1), true, nullptr);
+    EXPECT_TRUE(telemetryManager.ProcessJsonFile(m_testJsonFile));
+}
+
+TEST_F(TelemetryTest, ProcessCommandExecutedMissingSubcommandEvent)
+{
+    std::string realEvent =
+        R"({"EventName":"CommandExecuted","DistroName":"CentOS","Version":"1.3.0-preview123","CorrelationId":"{00000000-0000-0000-0000-000000000000}","CorrelationGroup":"TestGroup","Timestamp":"2025-10-17 22:52:56+0000","IsTestMode":true,"Duration":1234.5678,"Success":true,"ErrorKind":"Resource","ErrorResourceName":"Test Resource","ErrorResourceType":"Microsoft.OSConfig/Test","ErrorLocation":"utils/test.rs:123","ErrorCode":1})";
+    ASSERT_TRUE(CreateTestJsonFile(realEvent));
+    Telemetry::TelemetryManager telemetryManager(m_telemetryCache, false, std::chrono::seconds(1), true, nullptr);
+    EXPECT_FALSE(telemetryManager.ProcessJsonFile(m_testJsonFile));
+}

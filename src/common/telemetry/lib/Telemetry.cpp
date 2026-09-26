@@ -1,0 +1,327 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+//
+
+#include "Telemetry.hpp"
+
+#include "ParameterSets.hpp"
+
+#include <Keys.h>
+#include <LogManager.hpp>
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <nlohmann/json.hpp>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+#include <thread>
+#include <utility>
+
+using namespace MAT;
+
+namespace Telemetry
+{
+
+class TelemetryManagerImpl
+{
+public:
+    TelemetryManagerImpl(std::string cacheFilePath, bool enableDebug, std::chrono::seconds teardownTime, bool validateEvents, OsConfigLogHandle logHandle);
+    ~TelemetryManagerImpl() noexcept;
+
+    bool ProcessJsonFile(const std::string& filePath);
+
+private:
+    OsConfigLogHandle m_log;
+    MAT::ILogConfiguration m_logConfig;
+    MAT::ILogManager* m_logManager;
+    MAT::ILogger* m_logger;
+    bool m_validateEvents;
+
+    bool ValidateEventParameters(const std::string& eventName, const std::set<std::string>& jsonKeys);
+    bool ProcessJsonLine(const std::string& jsonLine);
+};
+
+TelemetryManagerImpl::TelemetryManagerImpl(std::string cacheFilePath, bool enableDebug, std::chrono::seconds teardownTime, bool validateEvents, OsConfigLogHandle logHandle)
+    : m_log(logHandle),
+      m_logManager(nullptr),
+      m_logger(nullptr),
+      m_validateEvents(validateEvents)
+{
+    {
+        FILE* testWrite = fopen(cacheFilePath.c_str(), "a");
+        if (testWrite)
+        {
+            fclose(testWrite);
+        }
+        else
+        {
+            OsConfigLogError(m_log, "Telemetry sdk cache path '%s' not writable, aborting", cacheFilePath.c_str());
+            throw std::runtime_error("Telemetry sdk cache path not writable, aborting");
+        }
+    }
+
+    m_logConfig["name"] = TelemetryManager::TELEMETRY_NAME;
+    m_logConfig["version"] = TelemetryManager::TELEMETRY_VERSION;
+    m_logConfig["config"]["host"] = "*";
+    m_logConfig[CFG_BOOL_ENABLE_TRACE] = enableDebug;
+    m_logConfig[CFG_INT_TRACE_LEVEL_MIN] = 0;
+    m_logConfig[CFG_INT_MAX_TEARDOWN_TIME] = teardownTime.count();
+    m_logConfig[CFG_STR_CACHE_FILE_PATH] = cacheFilePath;
+    m_logConfig[CFG_INT_CACHE_FILE_SIZE] = TelemetryManager::TELEMETRY_CACHE_FILE_SIZE;
+    m_logConfig[CFG_INT_RAM_QUEUE_SIZE] = TelemetryManager::TELEMETRY_RAM_QUEUE_SIZE;
+    m_logConfig[CFG_BOOL_ENABLE_DB_DROP_IF_FULL] = true;
+
+    status_t status = STATUS_SUCCESS;
+    m_logManager = LogManagerProvider::CreateLogManager(m_logConfig, status);
+    if ((STATUS_SUCCESS != status) || !m_logManager)
+    {
+        OsConfigLogError(m_log, "Telemetry initialization failed. status=%d", status);
+        throw std::runtime_error("Telemetry initialization failed");
+    }
+
+    m_logger = m_logManager->GetLogger(API_KEY, "logger_direct");
+    if (!m_logger)
+    {
+        OsConfigLogError(m_log, "Failed to get logger instance");
+        throw std::runtime_error("Failed to get logger instance");
+    }
+
+    OsConfigLogInfo(m_log, "Telemetry initialized successfully.");
+}
+
+TelemetryManagerImpl::~TelemetryManagerImpl() noexcept
+{
+    try
+    {
+        if (nullptr != m_logManager)
+        {
+            m_logManager->FlushAndTeardown();
+        }
+    }
+    catch (...)
+    {
+        OsConfigLogError(m_log, "Exception during telemetry shutdown");
+    }
+
+    LogManagerProvider::DestroyLogManager(TelemetryManager::TELEMETRY_NAME);
+
+    m_logger = nullptr;
+    m_logManager = nullptr;
+    OsConfigLogInfo(m_log, "Telemetry shutdown complete.");
+}
+
+bool TelemetryManagerImpl::ProcessJsonFile(const std::string& filePath)
+{
+    // Pause transmission while processing the file to batch upload later
+    m_logManager->PauseTransmission();
+
+    std::ifstream file(filePath);
+    if (!file.is_open())
+    {
+        OsConfigLogError(m_log, "Failed to open file: %s", filePath.c_str());
+        return false;
+    }
+
+    OsConfigLogInfo(m_log, "Processing JSON file: %s", filePath.c_str());
+
+    std::string line;
+    bool allSucceeded = true;
+
+    while (std::getline(file, line) && !line.empty())
+    {
+        if (!ProcessJsonLine(line))
+        {
+            allSucceeded = false;
+        }
+    }
+
+    // Flush events before resuming transmission due to known issue: https://github.com/microsoft/cpp_client_telemetry/issues/1189
+    m_logManager->Flush();
+
+    // Resume transmission and upload events manually (asynchronous action) due to another known issue: https://github.com/microsoft/cpp_client_telemetry/issues/1120
+    m_logManager->ResumeTransmission();
+    m_logManager->UploadNow();
+
+    return allSucceeded;
+}
+
+bool TelemetryManagerImpl::ValidateEventParameters(const std::string& eventName, const std::set<std::string>& jsonKeys)
+{
+    if (!m_validateEvents)
+    {
+        OsConfigLogDebug(m_log, "Skipped validation of event type: %s", eventName.c_str());
+        return true;
+    }
+
+    auto it = EVENT_PARAMETER_SETS.find(eventName);
+    if (it == EVENT_PARAMETER_SETS.end())
+    {
+        OsConfigLogError(m_log, "Unknown event type: %s", eventName.c_str());
+        return false;
+    }
+
+    const auto& requiredParams = it->second.first;
+    const auto& optionalParams = it->second.second;
+
+    // Check that all required parameters are present
+    for (const auto& requiredParam : requiredParams)
+    {
+        if (jsonKeys.find(requiredParam) == jsonKeys.end())
+        {
+            OsConfigLogError(m_log, "Missing required parameter '%s' for event '%s'", requiredParam.c_str(), eventName.c_str());
+            return false;
+        }
+    }
+
+    // Check that no unexpected parameters are present
+    for (const auto& jsonKey : jsonKeys)
+    {
+        if (jsonKey == "EventName")
+        {
+            continue; // Skip the event name field
+        }
+
+        if (requiredParams.find(jsonKey) == requiredParams.end() && optionalParams.find(jsonKey) == optionalParams.end())
+        {
+            OsConfigLogError(m_log, "Unexpected parameter '%s' for event '%s'", jsonKey.c_str(), eventName.c_str());
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool TelemetryManagerImpl::ProcessJsonLine(const std::string& jsonLine)
+{
+    OsConfigLogDebug(m_log, "Processing JSON line: %s", jsonLine.c_str());
+
+    nlohmann::json jsonObject;
+    try
+    {
+        jsonObject = nlohmann::json::parse(jsonLine);
+    }
+    catch (const nlohmann::json::exception& e)
+    {
+        OsConfigLogError(m_log, "JSON exception: %s", e.what());
+        return false;
+    }
+    catch (const std::exception& e)
+    {
+        OsConfigLogError(m_log, "Exception during JSON parsing: %s", e.what());
+        return false;
+    }
+    catch (...)
+    {
+        OsConfigLogError(m_log, "Unknown exception during JSON parsing");
+        return false;
+    }
+
+    if (!jsonObject.is_object())
+    {
+        OsConfigLogError(m_log, "JSON line is not an object: %s", jsonLine.c_str());
+        return false;
+    }
+
+    // Extract event name - required field
+    if (!jsonObject.contains("EventName") || !jsonObject["EventName"].is_string())
+    {
+        OsConfigLogError(m_log, "JSON object missing 'EventName' field: %s", jsonLine.c_str());
+        return false;
+    }
+    std::string eventName = jsonObject["EventName"].get<std::string>();
+
+    // Collect all JSON keys for validation
+    std::set<std::string> jsonKeys;
+    for (auto it = jsonObject.begin(); it != jsonObject.end(); ++it)
+    {
+        jsonKeys.insert(it.key());
+    }
+
+    if (!ValidateEventParameters(eventName, jsonKeys))
+    {
+        OsConfigLogError(m_log, "Parameter validation failed for event '%s': %s", eventName.c_str(), jsonLine.c_str());
+        return false;
+    }
+
+    // Create event with the event name
+    EventProperties event(eventName);
+
+    // Iterate over all key/value pairs in the JSON object
+    for (auto it = jsonObject.begin(); it != jsonObject.end(); ++it)
+    {
+        const std::string& key = it.key();
+        if (key == "EventName")
+        {
+            // Skip the EventName since it's already used for the event type
+            continue;
+        }
+
+        const auto& value = it.value();
+
+        // Handle different JSON value types
+        switch (value.type())
+        {
+            case nlohmann::json::value_t::string:
+                event.SetProperty(key, value.get<std::string>());
+                break;
+
+            case nlohmann::json::value_t::number_float:
+                event.SetProperty(key, value.get<double>());
+                break;
+
+            case nlohmann::json::value_t::number_integer:
+            case nlohmann::json::value_t::number_unsigned:
+                // Convert integer to double for consistency
+                event.SetProperty(key, static_cast<double>(value.get<int64_t>()));
+                break;
+
+            case nlohmann::json::value_t::boolean:
+                event.SetProperty(key, value.get<bool>());
+                break;
+
+            case nlohmann::json::value_t::null:
+                event.SetProperty(key, std::string(""));
+                break;
+
+            case nlohmann::json::value_t::object:
+            case nlohmann::json::value_t::array:
+                // For complex types (objects/arrays), serialize them as strings
+                event.SetProperty(key, value.dump());
+                break;
+
+            default:
+                OsConfigLogWarning(m_log, "Unexpected JSON type for key '%s'", key.c_str());
+                break;
+        }
+    }
+
+    // Remove dependency on built-in timers by configuring priority and latency accordingly
+    event.SetPriority(EventPriority_Immediate);
+    event.SetLatency(EventLatency_Max);
+
+    // Log the event with all properties
+    m_logger->LogEvent(event);
+    OsConfigLogDebug(m_log, "Successfully logged event to MAT");
+    return true;
+}
+
+TelemetryManager::TelemetryManager(std::string cacheFilePath, bool enableDebug, std::chrono::seconds teardownTime, bool validateEvents, OsConfigLogHandle logHandle)
+    : m_impl(new TelemetryManagerImpl(std::move(cacheFilePath), enableDebug, teardownTime, validateEvents, logHandle))
+{
+}
+
+TelemetryManager::~TelemetryManager() noexcept
+{
+    delete m_impl;
+}
+
+bool TelemetryManager::ProcessJsonFile(const std::string& filePath)
+{
+    return m_impl->ProcessJsonFile(filePath);
+}
+} // namespace Telemetry
