@@ -4,7 +4,7 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/microsoft/kompli/badge)](https://scorecard.dev/viewer/?uri=github.com/microsoft/kompli)
 
 Kompli is a Linux security compliance engine for evaluating and remediating system configuration against industry benchmarks (CIS, STIG, etc.). It is derived from the [Azure OSConfig](https://github.com/Azure/azure-osconfig) project, retaining only the ComplianceEngine module and its direct dependencies.
-
+                                                                                              
 ## History                                                                                                                                            
 
 This codebase originates from **Azure OSConfig** — a modular security configuration stack for Linux Edge devices developed by Microsoft, supporting multi-authority device management over Azure IoT Hub, GitOps, and local management. OSConfig consisted of a platform daemon, a PnP/MC adapter layer, and a set of management modules (CommandRunner, SecurityBaseline, DeviceInfo, Networking, Firewall, and others).
