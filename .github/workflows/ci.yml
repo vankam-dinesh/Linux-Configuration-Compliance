@@ -102,7 +102,7 @@ jobs:
           path: ./build/gtest-output
           output: ${{ matrix.target.name }}-${{ matrix.target.arch }}.xml
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: success() || failure()
         with:
           name: unit-test-${{ matrix.target.name }}-${{ matrix.target.arch }}
@@ -122,13 +122,13 @@ jobs:
     if: always()
     steps:
       - name: Download Test Report Artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           path: ci-test
           pattern: 'unit-test-*'
           merge-multiple: true
 
       - name: Publish Test Results
-        uses: EnricoMi/publish-unit-test-result-action@d0a4676d0e0b938bc201470d88276b7c74c712b3
+        uses: EnricoMi/publish-unit-test-result-action@7622c5bf3d112a72ab4fa3951c2aa5723d8ab92d
         with:
           files: 'ci-test/*.xml'
